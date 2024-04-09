@@ -1,0 +1,18 @@
+# lnw_updateECSService
+
+## Description
+Updates an ECS service by first checking the current task definition. If the
+image is different, it registers a new task definition with the desired image
+and then updates the ECS service to use this new task definition.
+
+## Parameters:
+- cluster: The short name or full Amazon Resource Name (ARN) the cluster that
+  hosts the service.
+- service: The name of the service to update.
+- taskDefinition: The family for the latest ACTIVE revision, family and revision
+  (family:revision ) for a specific revision in the family, or full ARN of the
+  task definition. For example, `ogs-client-event-api-service:32`
+- containerDefinition: The name of a container in the specified task definition.
+  This is found in the task definition JSON file under the `containerDefinitions`
+- imagURIe: Docker image URI to update in the task definition. For example;
+  012345678910.dkr.ecr.<region-name>.amazonaws.com/<repository-name>:latest

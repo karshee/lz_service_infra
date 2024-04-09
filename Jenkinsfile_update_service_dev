@@ -1,0 +1,48 @@
+@Library('pipelines@master') _
+
+pipeline {
+    agent { label 'aws-slave || docker-slave' }
+
+    environment {
+        AWS_CREDENTIALS = "LZ_CICD"
+        AWS_REGION = "eu-central-1"
+        AWS_ACCOUNT = "3532464326435"
+        CLUSTER_NAME = "XXXXX-dev-fft"
+        AWS_ROLE = "LZ_Ixxx_Update_Service_Role"
+    }
+
+    stages {
+        stage('Fetch ECS Services') {
+            steps {
+                withAWS(credentials: "${AWS_CREDENTIALS}", region: "${AWS_REGION}") {
+                    withAWS(roleAccount: "${AWS_ACCOUNT}", role: "${AWS_ROLE}", region: "${AWS_REGION}") {
+                        script {
+                            def services = sh(script: "aws ecs list-services --cluster ${CLUSTER_NAME} --region ${AWS_REGION} --output text", returnStdout: true).trim()
+                            services = services.split("\n").collect { it.split("/")[-1] }.join("\n")
+                            env.SERVICES = services
+                        }
+                    }
+                }
+            }
+        }
+        stage('Select ECS Service') {
+            steps {
+                script {
+                    env.SERVICE = input message: 'Select the ECS service to update', parameters: [choice(name: 'SERVICE', choices: env.SERVICES, description: 'Select the ECS service to update')]
+                }
+            }
+        }
+        stage('Update ECS Service') {
+            steps {
+                withAWS(credentials: "${AWS_CREDENTIALS}", region: "${AWS_REGION}") {
+                    withAWS(roleAccount: "${AWS_ACCOUNT}", role: "${AWS_ROLE}", region: "${AWS_REGION}") {
+                        script {
+                            sh "aws ecs update-service --cluster ${CLUSTER_NAME} --service ${env.SERVICE} --force-new-deployment --region ${AWS_REGION}"
+                            echo "ECS service ${env.SERVICE} updated"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

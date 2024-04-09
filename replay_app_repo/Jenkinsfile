@@ -1,0 +1,421 @@
+@Library('pipelines@master') _
+
+def REPOSITORY_NAME = "replay-service"
+def REPLAY_SERVICE_SERVER_NAME = "replay-service-server"
+def DOCKER_REGISTRY = "registry.ci.net"
+
+pipeline {
+    agent { node { label 'docker-slave' } }
+
+    environment {
+        AWS_CREDENTIALS = "xxxxxxxxx"
+        ECR_ACCOUNT = "xxxxxxxxxxx"
+        ECS_ACCOUNT = "xxxxxxxxxxx"
+        ECS_PROD_ACCOUNT = "xxxxxxxxxxx"
+        AWS_REGION = "eu-central-1"
+        PROJECT_NAME = "xxxxxxxxxxx"
+        REPOSITORY_NAME = "replayservice"
+        GIT_COMMIT_SHORT = "${GIT_COMMIT[0..7]}"
+        IMAGE_NAME = "${ECR_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}/${REPOSITORY_NAME}"
+    }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    tools {
+        maven 'Maven 3.6.0'
+        jdk 'jdk11'
+    }
+
+    stages {
+        stage('Check SCM Trigger Message') {
+            when {
+                not {
+                    anyOf {
+                        tag pattern: /^release\/(?:[0-9]+\.){2}[0-9]+$/, comparator: "REGEXP"
+                        tag pattern: /^dev\/(?:[0-9]+\.){2}[0-9]+$/, comparator: "REGEXP"
+                    }
+                }
+            }
+            steps {
+                script {
+                    sg_ciSkip action: 'check'
+                }
+            }
+        }
+
+        stage('FindBuildInitiator & SlackNotifyBuildStart') {
+            steps {
+                script {
+                    sg_slackNotifyBuildStart([slackCredentialID: 'sgdigitaljackpotapps', slackChannel: 'gdm-platform-apps-cicd', slackChannelReleases: 'gdm-platform-apps-cicd-releases'])
+                }
+            }
+        }
+
+        stage('Checkout') {
+             steps {
+                sg_checkout()
+            }
+        }
+
+        stage('Prepare') {
+            steps {
+                script {
+                    mavenMap = sg_prepare()
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    mavenMap.rtMaven.run pom: 'pom.xml', goals: '-B -Djava.awt.headless=true -Dmaven.test.skip -DskipITs -U clean install', buildInfo: mavenMap.buildInfo
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    mavenMap.rtMaven.run pom: 'pom.xml', goals: '-B -DskipITs test -P coverage', buildInfo: mavenMap.buildInfo
+                }
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+               }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    mavenMap.rtMaven.run pom: 'pom.xml', goals: '-pl replay-service-server -Dspring-boot.run.profiles=test test-compile failsafe:integration-test', buildInfo: mavenMap.buildInfo
+                }
+            }
+            post {
+               always {
+                   junit '**/target/failsafe-reports/*.xml'
+               }
+            }
+        }
+
+        stage('SonarQube') {
+            steps {
+                withSonarQubeEnv('Sonar Prod') {
+                    script {
+                        sg_sonarQube()
+                    }
+                }
+            }
+        }
+
+        stage('Tag Check') {
+            steps {
+                script {
+                    // Fetch the tag that contains the current commit
+                    def Tag = env.TAG_NAME
+                    echo Tag
+                    env.ENV = 'dev'
+
+                    if (Tag && Tag.contains('release')) {
+                        env.ENV = 'prd'
+                        echo "Tag contains release - Setting ENV to prod"
+                    }
+
+                    env.CLUSTER_NAME = "${PROJECT_NAME}-${env.ENV}-fft"
+                }
+            }
+        }
+
+        stage("Build Docker Image") {
+            steps {
+                echo "Building Docker Image"
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    if (env.BRANCH_NAME == 'master') {
+                        try {
+                            sh("docker build -f ${REPLAY_SERVICE_SERVER_NAME}/Dockerfile -t ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:${env.INCREMENTALVERSION} -t ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:latest ${REPLAY_SERVICE_SERVER_NAME}")
+                        } catch (Exception ex) {
+                            print(ex)
+                            error ex
+                        }
+                    } else {
+                        try {
+                            sh("docker build -f ${REPLAY_SERVICE_SERVER_NAME}/Dockerfile -t ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:${env.INCREMENTALVERSION} -t ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:dev ${REPLAY_SERVICE_SERVER_NAME}")
+                        } catch (Exception ex) {
+                            print(ex)
+                            error ex
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Push Docker Image to Docker Registry") {
+            steps {
+                echo "Pushing Docker Image"
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    sh("docker push ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:${env.INCREMENTALVERSION}")
+
+                    if (env.BRANCH_NAME == 'master') {
+                       try {
+                           sh("docker push ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:latest")
+                       } catch (Exception ex) {
+                           print(ex)
+                           error ex
+                       }
+                    } else {
+                        try {
+                            sh("docker push ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:dev")
+                        } catch (Exception ex) {
+                            print(ex)
+                            error ex
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Docker Push to AWS Landing-zone CICD ECR') {
+            when {
+                anyOf {
+                    branch 'master'
+                    tag pattern: /^release\/(?:[0-9]+\.){2}[0-9]+$/, comparator: "REGEXP"
+                    tag pattern: /^dev\/(?:[0-9]+\.){2}[0-9]+$/, comparator: "REGEXP"
+                }
+            }
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+                }
+
+                withAWS(credentials: "${AWS_CREDENTIALS}", region: "${AWS_REGION}") {
+                    withAWS(roleAccount: "${ECR_ACCOUNT}", role: "SGECRRole", region: "${AWS_REGION}") {
+                        script {
+                            def login = ecrLogin(registryIds: ["${ECR_ACCOUNT}"])
+                            sh("${login}")
+                            sh """docker tag ${DOCKER_REGISTRY}/developer/${REPLAY_SERVICE_SERVER_NAME}:${env.INCREMENTALVERSION} ${IMAGE_NAME}:${GIT_COMMIT_SHORT}"""
+                            sh """docker push ${IMAGE_NAME}:${GIT_COMMIT_SHORT}"""
+                            echo "Docker image pushed to ECR"
+                        }
+                    }
+                }
+            }
+        }
+        // This step is to deploy to dev or prod environment
+        // updates the task definition in ECS on Dev or prod account
+        // will deploy to dev if master
+        // will deploy to prod if release tag
+        // will deploy to dev if dev tag
+        stage("Update ECS Dev Service") {
+            when {
+                anyOf {
+                    branch 'master'
+                    tag pattern: /^release\/(?:[0-9]+\.){2}[0-9]+$/, comparator: "REGEXP"
+                    tag pattern: /^dev\/(?:[0-9]+\.){2}[0-9]+$/, comparator: "REGEXP"
+                }
+            }
+            steps {
+                script {
+                    withAWS(credentials: "${AWS_CREDENTIALS}", region: "${AWS_REGION}") {
+                        def targetAccount = (env.ENV == 'prd') ? "${ECS_PROD_ACCOUNT}" : "${ECS_ACCOUNT}"
+                        withAWS(roleAccount: targetAccount, role: "SGAnsibleSpokeAccounts", region: "${AWS_REGION}") {
+
+                            def taskDefinitionArn = sh(script: """aws ecs describe-services \
+                                --cluster ${env.CLUSTER_NAME} \
+                                --services ${env.REPOSITORY_NAME} \
+                                --query 'services[0].taskDefinition' \
+                                --output text""", returnStdout: true).trim()
+
+                            lnw_updateECSService(
+                                    "${env.CLUSTER_NAME}",
+                                    "${env.REPOSITORY_NAME}",
+                                    taskDefinitionArn,
+                                    "${env.REPOSITORY_NAME}",
+                                    "${IMAGE_NAME}:${GIT_COMMIT_SHORT}",
+                            )
+
+                            //extended wait
+                            def maxAttempts = 30 // Set your desired number of attempts
+                            def attempt = 0
+                            def stable = false
+                            while (attempt < maxAttempts && !stable) {
+                                try {
+                                    sh "aws ecs wait services-stable --cluster ${env.CLUSTER_NAME} --services ${env.REPOSITORY_NAME}"
+                                    stable = true
+                                } catch (Exception e) {
+                                    attempt++
+                                    if (attempt >= maxAttempts) {
+                                        error "Service did not become stable after $maxAttempts attempts"
+                                    }
+                                    sleep(30)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        stage('Artifactory Publish') {
+            steps {
+                script {
+                    sg_artifactory(mavenMap)
+                }
+            }
+        }
+
+        stage('Release') {
+            when { branch 'master' }
+            steps {
+                script {
+                    sg_releaseVersion()
+                }
+            }
+        }
+
+        stage('Upload BuildLog To Artifactory') {
+            steps {
+                script {
+                    sg_uploadBuildLogToArtifactory()
+                }
+            }
+        }
+
+        stage('Generate JavaDocs') {
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    mavenMap.rtMaven.run pom: 'pom.xml', goals: 'javadoc:javadoc', buildInfo: mavenMap.buildInfo
+                }
+            }
+        }
+
+        stage('Publish JavaDocs') {
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    if (env.BRANCH_NAME == 'master') {
+                        sshPublisher(
+                            publishers: [
+                                sshPublisherDesc(
+                                    configName: 'cat',
+                                    transfers: [
+                                        sshTransfer(
+                                            remoteDirectory: '/data/www/documentation/gdm-docs/current/api/replay-service-server',
+                                            removePrefix: 'replay-service-server/target/site/apidocs/',
+                                            sourceFiles: 'replay-service-server/target/site/apidocs/**'
+                                        )
+                                    ],
+                                    verbose: false
+                                )
+                            ]
+                        )
+                    } else {
+                        sshPublisher(
+                            publishers: [
+                                sshPublisherDesc(
+                                    configName: 'cat',
+                                    transfers: [
+                                        sshTransfer(
+                                            remoteDirectory: '/data/www/documentation/gdm-docs/dev-branch/api/replay-service-server',
+                                            removePrefix: 'replay-service-server/target/site/apidocs/',
+                                            sourceFiles: 'replay-service-server/target/site/apidocs/**'
+                                        )
+                                    ],
+                                    verbose: false
+                                )
+                            ]
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Generate Documentation') {
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    mavenMap.rtMaven.run pom: 'pom.xml', goals: 'generate-resources', buildInfo: mavenMap.buildInfo
+                }
+            }
+        }
+
+        // Documentation - AsciiDocs
+        stage('Publish Documentation') {
+            steps {
+                script {
+                    env.FINISHED_STAGE = env.STAGE_NAME
+
+                    if (env.BRANCH_NAME == 'master') {
+                        sshPublisher(
+                            publishers: [
+                                sshPublisherDesc(
+                                    configName: 'cat',
+                                    transfers: [
+                                        sshTransfer(
+                                            remoteDirectory: '/data/www/documentation/gdm-docs/current/reference/replay-service',
+                                            removePrefix: 'target/documentation/html/',
+                                            sourceFiles: 'target/documentation/html/**'
+                                        ),
+                                        sshTransfer(
+                                            remoteDirectory: '/data/www/documentation/gdm-docs/current/reference/replay-service',
+                                            removePrefix: 'target/documentation/pdf/',
+                                            sourceFiles: 'target/documentation/pdf/**'
+                                        )
+                                    ],
+                                    verbose: false
+                                )
+                            ]
+                        )
+                    } else {
+                        sshPublisher(
+                            publishers: [
+                                sshPublisherDesc(
+                                    configName: 'cat',
+                                    transfers: [
+                                        sshTransfer(
+                                            remoteDirectory: '/data/www/documentation/gdm-docs/dev-branch/reference/replay-service',
+                                            removePrefix: 'target/documentation/html/',
+                                            sourceFiles: 'target/documentation/html/**'
+                                        ),
+                                        sshTransfer(
+                                            remoteDirectory: '/data/www/documentation/gdm-docs/dev-branch/reference/replay-service',
+                                            removePrefix: 'target/documentation/pdf/',
+                                            sourceFiles: 'target/documentation/pdf/**'
+                                        )
+                                    ],
+                                    verbose: false
+                                )
+                            ]
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                sg_postAlways([slackCredentialID: 'sgdigitaljackpotapps', slackChannel: 'gdm-platform-apps-cicd', slackChannelReleases: 'gdm-platform-apps-cicd-releases'])
+            }
+        }
+    }
+}

@@ -1,0 +1,116 @@
+pipeline {
+    agent { label 'aws-slave || docker-slave' }
+
+    tools {
+        terraform "1.2.5"
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(name: 'ENV', choices: [ 'dev', 'prod'], description: 'Select env ')
+    }
+
+    environment {
+        APPLY = false
+        ENV = "${params.ENV}"
+        REGION = "eu-central-1"
+        location = "./"
+        INSTANCE = "fft"
+        ou = "xxxxx"
+        account = "xxxxxxx"
+        aws_credentials = "LZ_CICD"
+        cloudflare_credential = "LZ_CLOUDFLARE_FFT_NYXOP_NET"
+        grafana_credential = "GRAFANA_AUTH"
+    }
+
+    stages {
+        stage('Init') {
+            steps {
+                dir("${location}") {
+                    withAWS(credentials: "${aws_credentials}", region: "${REGION}") {
+                        withCredentials([string(credentialsId: "${cloudflare_credential}", variable: 'CLOUDFLARE_API_TOKEN')]) {
+                            withCredentials([string(credentialsId: "${grafana_credential}", variable: 'GRAFANA_AUTH')]) {
+                                sh "make -f tools/Makefile init INSTANCE=${INSTANCE} AWS_REGION=eu-west-1 OU=${ou} ACCOUNT=${account} ENV=${ENV}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Plan') {
+            steps {
+                dir("${location}") {
+                    withAWS(credentials: "${aws_credentials}", region: "${REGION}") {
+                        withCredentials([string(credentialsId: "${cloudflare_credential}", variable: 'CLOUDFLARE_API_TOKEN')]) {
+                            withCredentials([string(credentialsId: "${grafana_credential}", variable: 'GRAFANA_AUTH')]) {
+                                sh "make -f tools/Makefile destroy INSTANCE=${INSTANCE} AWS_REGION=${REGION} OU=${ou} ACCOUNT=${account} ENV=${ENV}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Approve') {
+            when {
+                anyOf {
+                    branch 'master'
+                    branch 'dev'
+                }
+            }
+            steps {
+                script {
+                    try {
+                        timeout(time: 20, unit: 'MINUTES') {
+                            APPROVE_PLAN = input message: "Approve plan? [WARNING: ${INSTANCE}-${ENV} will be DESTROYED]", ok: 'Continue',
+                                    parameters: [choice(name: 'APPROVE_PLAN', choices: 'YES\nNO', description: 'Approve plan?')]
+                            echo "APPROVE_PLAN = ${APPROVE_PLAN}"
+
+                            if ("${APPROVE_PLAN}" == 'YES') {
+                                echo "Approving plan"
+                                APPLY = true
+                            } else {
+                                APPLY = false
+                            }
+                        }
+                    } catch (error) {
+                        APPLY = false
+                        echo 'Plan timeout, skipping apply'
+                    }
+                }
+            }
+        }
+
+        stage('Apply') {
+            when {
+                allOf {
+                    expression { APPLY == true }
+
+                    anyOf {
+                        branch 'master'
+                        branch 'dev'
+                    }
+                }
+            }
+            steps {
+                withAWS(credentials: "${aws_credentials}", region: "${REGION}") {
+                    withCredentials([string(credentialsId: "${cloudflare_credential}", variable: 'CLOUDFLARE_API_TOKEN')]) {
+                        withCredentials([string(credentialsId: "${grafana_credential}", variable: 'GRAFANA_AUTH')]) {
+                            sh "make -f tools/Makefile apply APPROVE=yes INSTANCE=${INSTANCE} AWS_REGION=${REGION} OU=${ou} ACCOUNT=${account} ENV=${ENV}"
+                        }
+                    }
+                }
+            }
+            post {
+                failure {
+                    script { FAILURE_STAGE = 'Apply' }
+                }
+            }
+        }
+    }
+}
